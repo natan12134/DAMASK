@@ -1,0 +1,63 @@
+# Pure copper, nonlocal dislocation density based crystal plasticity
+# X. Zhang, J. Zhao, G. Kang, M. Zaiser, Int. J. Plast. 163 (2023) 103553, Table 4
+homogenization:
+  SX:
+    N_constituents: 1
+    mechanical: {type: pass}
+
+phase:
+  Cu:
+    lattice: cF
+    rho: 8960.0
+    mechanical:
+      output: [F, P, F_e, F_p, O]
+      elastic: {type: Hooke, C_11: 168.0e+9, C_12: 121.4e+9, C_44: 75.3e+9}
+      plastic:
+        type: nonlocal
+        references:
+          - X. Zhang et al.,
+            International Journal of Plasticity 163:103553, 2023,
+            https://doi.org/10.1016/j.ijplas.2023.103553
+        output: [rho_u_ed_pos, rho_u_ed_neg, rho_u_sc_pos, rho_u_sc_neg,
+                 rho_b_ed_pos, rho_b_ed_neg, rho_b_sc_pos, rho_b_sc_neg,
+                 rho_d_ed, rho_d_sc, gamma, tau_pass, tau_back]
+        N_sl: [12]
+        b_sl: [2.56e-10]               # Espinosa et al. 2006
+        d_ed: [1.536e-9]               # 6b, lower bound for stable edge dipoles
+        d_sc: [51.2e-9]                # 200b, lower bound for stable screw dipoles
+        i_sl: [50]                     # k_1, dislocation multiplication coefficient
+        f_ed_mult: 1.0                 # edges and screws contribute equally to multiplication (eq. 13)
+        f_ed: 0.01                     # k_2, edge jog parameter (Kords 2013)
+        rho_u_ed_pos_0: [2.5e+10]      # 12 x 4 x 2.5e10 = 1.2e12 /m²
+        rho_u_ed_neg_0: [2.5e+10]
+        rho_u_sc_pos_0: [2.5e+10]
+        rho_u_sc_neg_0: [2.5e+10]
+        rho_d_ed_0: [0.0]
+        rho_d_sc_0: [0.0]
+        sigma_rho_u: 0.0
+        B: 10.0                        # dislocation viscosity in Pa s, v = b tau_eff / B
+        tau_Peierls_ed: [0.5e+6]       # Grilli 2016
+        tau_Peierls_sc: [0.5e+6]
+        w: 10
+        p_sl: 1
+        q_sl: 1
+        nu_a: 50.0e+9
+        Q_sol: 1.0e-25                 # no solid solution strengthening (pure Cu)
+        c_sol: 1.0e-6
+        f_sol: 1.0
+        D_0: 0.0                       # no thermally activated climb (room temperature)
+        Q_cl: 1.0
+        V_at: 1.18e-29
+        h_sl-sl: [0.122, 0.122, 0.625, 0.07, 0.137, 0.137, 0.122]   # Kubin et al. 2008, Table 2
+        f_F: 0.0                       # no line tension correction of interaction coefficients
+        short_range_stress_correction: true                          # back stress, eq. 26
+        GB_transmission: probabilistic # eqs. 43-45
+        E_GB: 1.0                      # high-angle GB energy of Cu in J/m² (Bulatov et al. 2014)
+        theta_GB: 15.0                 # transition low/high-angle GB in degree (Read-Shockley)
+        C_GB: 1.0                      # eq. 44
+        eta_GB: 0.5                    # eq. 45 (Hull and Bacon 2001)
+        rate_equations: Zhang2023
+        rho_significant: 1.0e+6
+        rho_min: 0.0
+        atol_rho: 1.0e+4
+        C_CFL: 1.5

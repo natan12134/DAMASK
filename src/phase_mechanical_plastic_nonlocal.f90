@@ -84,7 +84,11 @@ submodule(phase:plastic) nonlocal
       f_F, &
       f_ed, &
       mu, &
-      nu
+      nu, &
+      C_GB, &                                                                                       !< prefactor of internal stress distribution tail (Zhang et al. 2023, eq. 43)
+      eta_GB, &                                                                                     !< ledge energy factor (Zhang et al. 2023, eq. 45)
+      E_GB, &                                                                                       !< energy of high-angle grain boundaries in J/m²
+      theta_GB                                                                                      !< transition angle low/high-angle grain boundary (Read-Shockley) in rad
     real(pREAL), dimension(:),      allocatable :: &
       i_sl, &                                                                                       !< mean free path prefactor for each
       b_sl                                                                                          !< absolute length of Burgers vector [m]
@@ -110,7 +114,9 @@ submodule(phase:plastic) nonlocal
     character(len=pSTRLEN), dimension(:), allocatable :: &
       output
     logical :: &
-      shortRangeStressCorrection                                                                    !< use of short range stress correction by excess density gradient term
+      shortRangeStressCorrection, &                                                                 !< use of short range stress correction by excess density gradient term
+      probabilisticGB, &                                                                            !< probabilistic dislocation transmission at grain boundaries (Zhang et al. 2023)
+      ratesZhang2023                                                                                !< dipole knock-out and jog formation according to Zhang et al. 2023
     character(len=:),          allocatable, dimension(:) :: &
       systems_sl
   end type tParameters
@@ -123,6 +129,13 @@ submodule(phase:plastic) nonlocal
       max_dipole_height
     real(pREAL), allocatable, dimension(:,:,:,:,:) :: &
       compatibility
+    real(pREAL), allocatable, dimension(:,:,:,:) :: &
+      GB_score, &                                                                                   !< selection score for outgoing slip system (neighbor system, my system, neighbor, entry)
+      GB_tau_c                                                                                      !< critical stress for transmission (neighbor system, my system, neighbor, entry)
+    logical, allocatable, dimension(:,:) :: &
+      GB_isGB                                                                                       !< interface is a grain boundary (neighbor, entry)
+    logical, allocatable, dimension(:) :: &
+      GB_initialized
   end type tNonlocalDependentState
 
   type :: tNonlocalState
@@ -143,6 +156,7 @@ submodule(phase:plastic) nonlocal
           rho_dip_edg, &
           rho_dip_scr, &
       gamma, &
+      tau, &
       v, &
         v_edg_pos, &
         v_edg_neg, &
@@ -321,6 +335,32 @@ module function plastic_nonlocal_init() result(myPlasticity)
       prm%f_ed_mult                   = pl%get_asReal('f_ed_mult')
       prm%shortRangeStressCorrection  = pl%get_asBool('short_range_stress_correction', defaultVal = .false.)
 
+      select case(pl%get_asStr('GB_transmission',defaultVal='compatibility'))
+        case('compatibility')
+          prm%probabilisticGB = .false.
+        case('probabilistic')
+          prm%probabilisticGB = .true.
+          prm%C_GB     = pl%get_asReal('C_GB',    defaultVal=1.0_pREAL)
+          prm%eta_GB   = pl%get_asReal('eta_GB',  defaultVal=0.5_pREAL)
+          prm%E_GB     = pl%get_asReal('E_GB')
+          prm%theta_GB = pl%get_asReal('theta_GB',defaultVal=15.0_pREAL) * PI/180.0_pREAL
+          if (prm%C_GB     <  0.0_pREAL) extmsg = trim(extmsg)//' C_GB'
+          if (prm%eta_GB   <  0.0_pREAL) extmsg = trim(extmsg)//' eta_GB'
+          if (prm%E_GB     <  0.0_pREAL) extmsg = trim(extmsg)//' E_GB'
+          if (prm%theta_GB <= 0.0_pREAL) extmsg = trim(extmsg)//' theta_GB'
+        case default
+          extmsg = trim(extmsg)//' GB_transmission'
+      end select
+
+      select case(pl%get_asStr('rate_equations',defaultVal='Kords2013'))
+        case('Kords2013')
+          prm%ratesZhang2023 = .false.
+        case('Zhang2023')
+          prm%ratesZhang2023 = .true.
+        case default
+          extmsg = trim(extmsg)//' rate_equations'
+      end select
+
 
 !--------------------------------------------------------------------------------------------------
 !  sanity checks
@@ -381,7 +421,8 @@ module function plastic_nonlocal_init() result(myPlasticity)
                          'gamma              ' ]) * prm%sum_N_sl                                    !< "basic" microstructural state variables that are independent from other state variables
     sizeState          = sizeDotState &
                        + size([ 'velocityEdgePos     ','velocityEdgeNeg     ', &
-                                'velocityScrewPos    ','velocityScrewNeg    ']) * prm%sum_N_sl      !< other dependent state variables that are not updated by microstructure
+                                'velocityScrewPos    ','velocityScrewNeg    ', &
+                                'resolvedStress      ']) * prm%sum_N_sl                             !< other dependent state variables that are not updated by microstructure
     sizeDeltaState            = sizeDotState
 
     call phase_allocateState(plasticState(ph),Nmembers,sizeState,sizeDotState,sizeDeltaState,0)     ! ToDo: state structure does not follow convention
@@ -472,12 +513,20 @@ module function plastic_nonlocal_init() result(myPlasticity)
         stt%v_edg_neg  => plasticState(ph)%state             (12*prm%sum_N_sl + 1:13*prm%sum_N_sl,1:Nmembers)
         stt%v_scr_pos  => plasticState(ph)%state             (13*prm%sum_N_sl + 1:14*prm%sum_N_sl,1:Nmembers)
         stt%v_scr_neg  => plasticState(ph)%state             (14*prm%sum_N_sl + 1:15*prm%sum_N_sl,1:Nmembers)
+    stt%tau        => plasticState(ph)%state                 (15*prm%sum_N_sl + 1:16*prm%sum_N_sl,1:Nmembers)
+    st0%tau        => plasticState(ph)%state0                (15*prm%sum_N_sl + 1:16*prm%sum_N_sl,1:Nmembers)
 
     allocate(dst%tau_pass(prm%sum_N_sl,Nmembers),source=0.0_pREAL)
     allocate(dst%tau_back(prm%sum_N_sl,Nmembers),source=0.0_pREAL)
     allocate(dst%rho_forest(prm%sum_N_sl,Nmembers),source=0.0_pREAL)
     allocate(dst%max_dipole_height(2*prm%sum_N_sl,Nmembers),source=0.0_pREAL)                       ! edge and screw
     allocate(dst%compatibility(2,maxval(param%sum_N_sl),maxval(param%sum_N_sl),nCellNeighbors,Nmembers),source=0.0_pREAL)
+    if (prm%probabilisticGB) then
+      allocate(dst%GB_score(prm%sum_N_sl,prm%sum_N_sl,nCellNeighbors,Nmembers),source=0.0_pREAL)
+      allocate(dst%GB_tau_c(prm%sum_N_sl,prm%sum_N_sl,nCellNeighbors,Nmembers),source=huge(1.0_pREAL))
+      allocate(dst%GB_isGB(nCellNeighbors,Nmembers),source=.false.)
+      allocate(dst%GB_initialized(Nmembers),source=.false.)
+    end if
     end associate
 
     if (Nmembers > 0) call stateInit(ini,ph,Nmembers)
@@ -615,7 +664,7 @@ module subroutine nonlocal_dependentState(ph, en)
             connection_latticeConf(1:3,n) = matmul(invFe, geom(ph)%x_0(1:3,en_nbr) &
                                           - geom(ph)%x_0(1:3,en))
             normal_latticeConf = matmul(transpose(invFp), geom(ph)%n_0(1:3,n,en))
-            if (math_inner(normal_latticeConf,connection_latticeConf(1:3,n)) < 0.0_pREAL) &         ! neighboring connection points in opposite direction to face normal: must be periodic image
+            if (math_inner(normal_latticeConf,connection_latticeConf(1:3,n)) <= 0.0_pREAL) &        ! neighboring connection points in opposite direction to face normal (or neighbor is myself): must be periodic image
               connection_latticeConf(1:3,n) = normal_latticeConf * geom(ph)%v_0(en)/geom(ph)%a_0(n,en)  ! instead take the surface normal scaled with the diameter of the cell
         else
           ! local neighbor or different lattice structure or different constitution instance -> use central values instead
@@ -740,6 +789,7 @@ module subroutine nonlocal_LpAndItsTangent(Lp,dLp_dMp, &
     end do
     tauNS = tauNS + spread(dst%tau_back(:,en),2,4)
     tau   = tau   + dst%tau_back(:,en)
+    stt%tau(:,en) = tau
 
     ! edges
     call kinetics(v(:,1), dv_dtau(:,1), dv_dtauNS(:,1), &
@@ -1007,17 +1057,35 @@ module subroutine nonlocal_dotState(Mp,Delta_t, &
 
   ! athermal annihilation
   rhoDotAthermalAnnihilation = 0.0_pREAL
-  forall (c=1:2) &
-    rhoDotAthermalAnnihilation(:,c+8) = -2.0_pREAL * dLower(:,c) / prm%b_sl &
-       * (  2.0_pREAL * (rho_sgl(:,2*c-1) * abs(gamma_dot(:,2*c)) + rho_sgl(:,2*c) * abs(gamma_dot(:,2*c-1))) & ! was single hitting single
-          + 2.0_pREAL * (abs(rho_sgl(:,2*c+3)) * abs(gamma_dot(:,2*c)) + abs(rho_sgl(:,2*c+4)) * abs(gamma_dot(:,2*c-1))) & ! was single hitting immobile single or was immobile single hit by single
-          + rho_dip(:,c) * (abs(gamma_dot(:,2*c-1)) + abs(gamma_dot(:,2*c))))                                  ! single knocks dipole constituent
+  if (prm%ratesZhang2023) then
+    ! Zhang et al. 2023, eqs. 17 and 20: spontaneous annihilation of closely approaching singles and
+    ! knock-out of dipole constituents by passing singles (releasing the partner)
+    forall (c=1:2) &
+      rhoDotAthermalAnnihilation(:,c+8) = -2.0_pREAL * dLower(:,c) / prm%b_sl &
+         * 2.0_pREAL * (rho_sgl(:,2*c-1) * abs(gamma_dot(:,2*c)) + rho_sgl(:,2*c) * abs(gamma_dot(:,2*c-1))) &
+                                        - 2.0_pREAL * (dUpper(:,c) - dLower(:,c)) / prm%b_sl &
+         * rho_dip(:,c) * (abs(gamma_dot(:,2*c-1)) + abs(gamma_dot(:,2*c)))
+  else
+    forall (c=1:2) &
+      rhoDotAthermalAnnihilation(:,c+8) = -2.0_pREAL * dLower(:,c) / prm%b_sl &
+         * (  2.0_pREAL * (rho_sgl(:,2*c-1) * abs(gamma_dot(:,2*c)) + rho_sgl(:,2*c) * abs(gamma_dot(:,2*c-1))) & ! was single hitting single
+            + 2.0_pREAL * (abs(rho_sgl(:,2*c+3)) * abs(gamma_dot(:,2*c)) + abs(rho_sgl(:,2*c+4)) * abs(gamma_dot(:,2*c-1))) & ! was single hitting immobile single or was immobile single hit by single
+            + rho_dip(:,c) * (abs(gamma_dot(:,2*c-1)) + abs(gamma_dot(:,2*c))))                                  ! single knocks dipole constituent
+  end if
 
   ! annihilated screw dipoles leave edge jogs behind on the colinear system
-  if (phase_lattice(ph) == 'cF') &
-    forall (s = 1:prm%sum_N_sl, prm%colinearSystem(s) > 0) &
-      rhoDotAthermalAnnihilation(prm%colinearSystem(s),1:2) = - rhoDotAthermalAnnihilation(s,10) &
-        * 0.25_pREAL * sqrt(dst%rho_forest(s,en)) * (dUpper(s,2) + dLower(s,2)) * prm%f_ed
+  if (phase_lattice(ph) == 'cF') then
+    if (prm%ratesZhang2023) then
+      ! Zhang et al. 2023, eqs. 18 and 19: jog length is half the annihilation distance
+      forall (s = 1:prm%sum_N_sl, prm%colinearSystem(s) > 0) &
+        rhoDotAthermalAnnihilation(prm%colinearSystem(s),1:2) = - rhoDotAthermalAnnihilation(s,10) &
+          * 0.25_pREAL * sqrt(dst%rho_forest(s,en)) * dLower(s,2) * prm%f_ed
+    else
+      forall (s = 1:prm%sum_N_sl, prm%colinearSystem(s) > 0) &
+        rhoDotAthermalAnnihilation(prm%colinearSystem(s),1:2) = - rhoDotAthermalAnnihilation(s,10) &
+          * 0.25_pREAL * sqrt(dst%rho_forest(s,en)) * (dUpper(s,2) + dLower(s,2)) * prm%f_ed
+    end if
+  end if
 
 
   ! thermally activated annihilation of edge dipoles by climb
@@ -1079,7 +1147,9 @@ function rhoDotFlux(Delta_T,ph,en)
     en_nbr,&                                                                                        !< neighbor phase entry
     ph_nbr,&                                                                                        !< neighbor phase ID
     topp, &                                                                                         !< type of dislocation with opposite sign to t
-    s                                                                                               !< index of my current slip system
+    s, &                                                                                            !< index of my current slip system
+    s_out, &                                                                                        !< outgoing slip system for transmission across grain boundary
+    t_out                                                                                           !< outgoing dislocation type for transmission across grain boundary
   real(pREAL), dimension(param(ph)%sum_N_sl,10) :: &
     rho, &
     rho_0, &                                                                                        !< dislocation density at beginning of time step
@@ -1104,10 +1174,14 @@ function rhoDotFlux(Delta_T,ph,en)
     normal_neighbor2me_defConf, &                                                                   !< interface normal pointing from my neighbor to en in shared deformed configuration
     normal_me2neighbor, &                                                                           !< interface normal pointing from en to my neighbor in my lattice configuration
     normal_me2neighbor_defConf                                                                      !< interface normal pointing from en to my neighbor in shared deformed configuration
+  real(pREAL), dimension(3) :: &
+    normal_receiver                                                                                 !< interface normal pointing into the receiving grain in its lattice configuration
   real(pREAL) :: &
     a, &                                                                                            !< area of the current interface
     transmissivity, &                                                                               !< overall transmissivity of dislocation flux to neighboring material point
-    lineLength                                                                                      !< dislocation line length leaving the current interface
+    lineLength, &                                                                                   !< dislocation line length leaving the current interface
+    mu, &
+    rho_tot                                                                                         !< total dislocation density of the emitting material point
 
 
   associate(prm => param(ph), &
@@ -1127,6 +1201,7 @@ function rhoDotFlux(Delta_T,ph,en)
   gamma_dot = rho(:,mob) * v * spread(prm%b_sl,2,4)
 
   v_0 = reshape(st0%v(:,en),[prm%sum_N_sl,4])
+  mu = elastic_mu(ph,en,prm%isotropic_bound)
 
   !****************************************************************************
   !*** calculate dislocation fluxes (only for nonlocal plasticity)
@@ -1175,6 +1250,42 @@ function rhoDotFlux(Delta_T,ph,en)
       end if
 
       v_0_nbr = 0.0_pREAL        ! needed for check of sign change in flux density below
+
+      !* FLUX FROM MY NEIGHBOR TO ME ACROSS A GRAIN BOUNDARY (probabilistic transmission)
+      !* Zhang et al. 2023, section 3.3: The incoming dislocations are transmitted with probability
+      !* P_trans (eq. 44) to the outgoing system selected by geometrical and mechanical criteria.
+      if (prm%probabilisticGB .and. n_nbr > 0) then
+      if (dst%GB_isGB(n,en) .and. mechanical_plasticity_type(ph_nbr) == MECHANICAL_PLASTICITY_NONLOCAL) then
+        v_0_nbr = reshape(state0(ph_nbr)%v(:,en_nbr),[ns,4])
+        rho_0_sgl_mob_nbr = max(reshape(state0(ph_nbr)%rho_sgl_mob(:,en_nbr),[ns,4]),0.0_pREAL)
+        where (rho_0_sgl_mob_nbr * geom(ph_nbr)%v_0(en_nbr) ** 0.667_pREAL < prm%rho_min &
+          .or. rho_0_sgl_mob_nbr < prm%rho_significant) &
+          rho_0_sgl_mob_nbr = 0.0_pREAL
+        rho_tot = sum(abs(getRho0(ph_nbr,en_nbr)))
+        normal_neighbor2me_defConf = math_det33(Favg) * matmul(math_inv33(transpose(Favg)), &
+                                     geom(ph_nbr)%n_0(1:3,n_nbr,en_nbr))
+        normal_neighbor2me = matmul(transpose(F_e_nbr), normal_neighbor2me_defConf) &
+                           / math_det33(F_e_nbr)
+        a = geom(ph_nbr)%a_0(n_nbr,en_nbr) * norm2(normal_neighbor2me)
+        normal_neighbor2me = normal_neighbor2me / norm2(normal_neighbor2me)
+        normal_receiver = matmul(transpose(my_Fe), normal_neighbor2me_defConf)
+        normal_receiver = normal_receiver / norm2(normal_receiver)
+        do s = 1,ns
+          do t = 1,4
+            if (v_0_nbr(s,t) * math_inner(m(1:3,s,t), normal_neighbor2me) > 0.0_pREAL) then
+              call selectOutgoing(s_out,t_out,dst%GB_score(s,:,n,en),v_0,m,normal_receiver,(t+1)/2)
+              if (s_out > 0) then
+                lineLength = rho_0_sgl_mob_nbr(s,t) * v_0_nbr(s,t) &
+                           * math_inner(m(1:3,s,t), normal_neighbor2me) * a
+                rhoDotFlux(s_out,t_out) = rhoDotFlux(s_out,t_out) + lineLength/geom(ph)%v_0(en) &
+                                        * transmissionProbability(prm%C_GB,mu,prm%b_sl(s),rho_tot, &
+                                                                  state0(ph_nbr)%tau(s,en_nbr), &
+                                                                  dst%GB_tau_c(s,s_out,n,en))
+              end if
+            end if
+          end do
+        end do
+      end if; end if
 
       !* FLUX FROM MY NEIGHBOR TO ME
       !* This is only considered, if I have a neighbor of nonlocal plasticity
@@ -1230,6 +1341,38 @@ function rhoDotFlux(Delta_T,ph,en)
       !* In case of reduced transmissivity, part of the leaving flux is stored as dead dislocation density.
       !* That means for an interface of zero transmissivity the leaving flux is fully converted to dead dislocations.
       if (opposite_n > 0) then
+      if (prm%probabilisticGB .and. n_nbr > 0) then
+      if (dst%GB_isGB(n,en)) then
+
+        !* FLUX FROM ME TO MY NEIGHBOR ACROSS A GRAIN BOUNDARY (probabilistic transmission)
+        !* Blocked dislocations are not leaving and remain as mobile density (pile-up), Zhang et al. 2023, section 3.3.
+        rho_tot = sum(abs(rho_0))
+        v_0_nbr = reshape(state0(ph_nbr)%v(:,en_nbr),[ns,4])
+        normal_me2neighbor_defConf = math_det33(Favg) &
+                                   * matmul(math_inv33(transpose(Favg)),geom(ph)%n_0(1:3,n,en))
+        normal_me2neighbor = matmul(transpose(my_Fe), normal_me2neighbor_defConf) &
+                           / math_det33(my_Fe)
+        a = geom(ph)%a_0(n,en) * norm2(normal_me2neighbor)
+        normal_me2neighbor = normal_me2neighbor / norm2(normal_me2neighbor)
+        normal_receiver = matmul(transpose(F_e_nbr), normal_me2neighbor_defConf)
+        normal_receiver = normal_receiver / norm2(normal_receiver)
+        do s = 1,ns
+          do t = 1,4
+            if (v_0(s,t) * math_inner(m(1:3,s,t), normal_me2neighbor) > 0.0_pREAL) then
+              call selectOutgoing(s_out,t_out,dst%GB_score(:,s,n,en),v_0_nbr,m,normal_receiver,(t+1)/2)
+              if (s_out > 0) then
+                lineLength = rho_0_sgl_mob(s,t) * v_0(s,t) &
+                           * math_inner(m(1:3,s,t), normal_me2neighbor) * a
+                rhoDotFlux(s,t) = rhoDotFlux(s,t) - lineLength/geom(ph)%v_0(en) &
+                                * transmissionProbability(prm%C_GB,mu,prm%b_sl(s),rho_tot, &
+                                                          st0%tau(s,en),dst%GB_tau_c(s_out,s,n,en))
+              end if
+            end if
+          end do
+        end do
+        cycle neighbors
+      end if; end if
+
       if (mechanical_plasticity_type(ph_nbr) == MECHANICAL_PLASTICITY_NONLOCAL) then
 
         normal_me2neighbor_defConf = math_det33(Favg) &
@@ -1319,6 +1462,17 @@ module subroutine plastic_nonlocal_updateCompatibility(orientation,ph,en)
       elseif (ph_nbr /= ph) then                                                                    ! phase boundary
         if (plasticState(ph_nbr)%nonlocal .and. plasticState(ph)%nonlocal) &
           forall(s1 = 1:ns) my_compatibility(:,s1,s1,n) = 0.0_pREAL
+      elseif (prm%probabilisticGB) then                                                             ! grain boundary with probabilistic transmission
+        if (any(dNeq(phase_O_0(ph)%data(en)%asQuaternion(), &
+                     phase_O_0(ph_nbr)%data(en_nbr)%asQuaternion()))) then
+          forall(s1 = 1:ns) my_compatibility(:,s1,s1,n) = 0.0_pREAL                                 ! flux is handled separately in rhoDotFlux
+          if (.not. dependentState(ph)%GB_initialized(en)) then
+            dependentState(ph)%GB_isGB(n,en) = .true.
+            call GB_geometry(dependentState(ph)%GB_score(:,:,n,en),dependentState(ph)%GB_tau_c(:,:,n,en), &
+                             phase_O_0(ph)%data(en),phase_O_0(ph_nbr)%data(en_nbr), &
+                             geom(ph)%n_0(1:3,n,en),elastic_mu(ph,en,prm%isotropic_bound),ph)
+          end if
+        end if
       elseif (prm%chi_GB >= 0.0_pREAL) then                                                         ! grain boundary
         if (any(dNeq(phase_O_0(ph)%data(en)%asQuaternion(), &
                      phase_O_0(ph_nbr)%data(en_nbr)%asQuaternion())) .and. &
@@ -1369,10 +1523,149 @@ module subroutine plastic_nonlocal_updateCompatibility(orientation,ph,en)
     end do neighbors
 
     dependentState(ph)%compatibility(:,:,:,:,en) = my_compatibility
+    if (prm%probabilisticGB) dependentState(ph)%GB_initialized(en) = .true.
 
   end associate
 
 end subroutine plastic_nonlocal_updateCompatibility
+
+
+!--------------------------------------------------------------------------------------------------
+!> @brief Geometric quantities for dislocation transmission across a grain boundary.
+!> @details Zhang et al. 2023 (https://doi.org/10.1016/j.ijplas.2023.103553), section 3.3.
+! For each pair of incoming (s_in) and outgoing (s_out) slip system a selection score combining
+! the alignment of the slip plane traces on the boundary and the residual Burgers vector is
+! computed, together with the critical stress for transmission (eq. 45). Both quantities are
+! symmetric with respect to the two sides of the boundary, which ensures that both material points
+! sharing the interface select the same outgoing system.
+!--------------------------------------------------------------------------------------------------
+subroutine GB_geometry(score,tau_c,O_me,O_nbr,normal,mu,ph)
+
+  real(pREAL), dimension(:,:), intent(out) :: &
+    score, &                                                                                        !< (outgoing system in neighbor, incoming system in me)
+    tau_c
+  type(tRotation), intent(in) :: O_me, O_nbr
+  real(pREAL), dimension(3), intent(in) :: normal                                                   !< GB normal in sample frame
+  real(pREAL), intent(in) :: mu
+  integer, intent(in) :: ph
+
+  integer :: s1, s2
+  real(pREAL) :: theta, E_GB, b_ledge
+  real(pREAL), dimension(3) :: l_me, l_nbr, d_me, d_nbr
+
+
+  associate(prm => param(ph))
+
+    theta = disorientationAngle_cubic(O_me,O_nbr)
+    E_GB = prm%E_GB
+    if (theta < prm%theta_GB) &                                                                     ! Read-Shockley for low-angle boundaries
+      E_GB = prm%E_GB * theta/prm%theta_GB * (1.0_pREAL - log(max(theta,1.0e-6_pREAL)/prm%theta_GB))
+
+    do s1 = 1, prm%sum_N_sl
+      d_me = O_me%rotate(prm%slip_direction(1:3,s1),active=.true.)
+      l_me = math_cross(O_me%rotate(prm%slip_normal(1:3,s1),active=.true.),normal)
+      if (norm2(l_me) > 1.0e-6_pREAL) l_me = l_me/norm2(l_me)
+      do s2 = 1, prm%sum_N_sl
+        d_nbr = O_nbr%rotate(prm%slip_direction(1:3,s2),active=.true.)
+        l_nbr = math_cross(O_nbr%rotate(prm%slip_normal(1:3,s2),active=.true.),normal)
+        if (norm2(l_nbr) > 1.0e-6_pREAL) l_nbr = l_nbr/norm2(l_nbr)
+        b_ledge = prm%b_sl(s1) * sqrt(max(0.0_pREAL,2.0_pREAL - 2.0_pREAL*abs(math_inner(d_me,d_nbr))))  ! smallest |b_in - b_out|
+        score(s2,s1) = abs(math_inner(l_me,l_nbr)) * abs(math_inner(d_me,d_nbr))
+        tau_c(s2,s1) = (E_GB*prm%b_sl(s1) + prm%eta_GB*mu*b_ledge**2)/prm%b_sl(s1)**2               ! eq. 45
+      end do
+    end do
+
+  end associate
+
+end subroutine GB_geometry
+
+
+!--------------------------------------------------------------------------------------------------
+!> @brief Disorientation angle between two cubic orientations.
+!--------------------------------------------------------------------------------------------------
+pure function disorientationAngle_cubic(O_1,O_2) result(theta)
+
+  type(tRotation), intent(in) :: O_1, O_2
+  real(pREAL) :: theta
+
+  real(pREAL), dimension(3,3) :: dR, S
+  integer, dimension(3,6), parameter :: PERM = reshape([1,2,3, 2,3,1, 3,1,2, 1,3,2, 3,2,1, 2,1,3],[3,6])
+  integer :: p, i, j, k
+
+
+  dR = matmul(O_2%asMatrix(),transpose(O_1%asMatrix()))
+  theta = PI
+  do p = 1, 6; do i = -1, 1, 2; do j = -1, 1, 2; do k = -1, 1, 2                                  ! proper signed permutation matrices (point group 432)
+    S = 0.0_pREAL
+    S(1,PERM(1,p)) = real(i,pREAL)
+    S(2,PERM(2,p)) = real(j,pREAL)
+    S(3,PERM(3,p)) = real(k,pREAL)
+    if (math_det33(S) < 0.0_pREAL) cycle
+    theta = min(theta, acos(max(-1.0_pREAL,min(1.0_pREAL,0.5_pREAL*(math_trace33(matmul(S,dR))-1.0_pREAL)))))
+  end do; end do; end do; end do
+
+end function disorientationAngle_cubic
+
+
+!--------------------------------------------------------------------------------------------------
+!> @brief Probability of transmission across a grain boundary (Zhang et al. 2023, eq. 44).
+!--------------------------------------------------------------------------------------------------
+pure function transmissionProbability(C,mu,b,rho,tau,tau_c) result(P)
+
+  real(pREAL), intent(in) :: C, mu, b, rho, tau, tau_c
+  real(pREAL) :: P
+
+
+  if (abs(tau) >= tau_c) then
+    P = 1.0_pREAL
+  else
+    P = 0.5_pREAL*C*(mu*b)**2*rho * (1.0_pREAL/(tau_c-abs(tau))**2 + 1.0_pREAL/(tau_c+abs(tau))**2)
+    P = min(1.0_pREAL,max(0.0_pREAL,P))
+  end if
+
+end function transmissionProbability
+
+
+!--------------------------------------------------------------------------------------------------
+!> @brief Select outgoing slip system and dislocation type for transmission across a grain boundary.
+!> @details Zhang et al. 2023, section 3.3: Among the systems of the receiving grain that are
+! operating in the direction leading away from the boundary (tau_eff > 0), the one with the best
+! alignment of slip traces and smallest residual Burgers vector is selected.
+!--------------------------------------------------------------------------------------------------
+pure subroutine selectOutgoing(s_out,t_out,score,v,m,normal,c)
+
+  integer, intent(out) :: s_out, t_out
+  real(pREAL), dimension(:), intent(in) :: score                                                    !< score of all systems in receiving grain
+  real(pREAL), dimension(:,:), intent(in) :: v                                                      !< velocities in receiving grain (system, type)
+  real(pREAL), dimension(:,:,:), intent(in) :: m                                                    !< glide directions in receiving lattice
+  real(pREAL), dimension(3), intent(in) :: normal                                                   !< interface normal pointing into receiving grain (receiving lattice)
+  integer, intent(in) :: c                                                                          !< character (1: edge, 2: screw)
+
+  integer :: s, t
+  real(pREAL) :: best, proj, bestProj
+
+
+  s_out = 0
+  t_out = 0
+  best = -1.0_pREAL
+  do s = 1, size(score)
+    bestProj = 0.0_pREAL
+    do t = 2*c-1, 2*c
+      proj = v(s,t) * math_inner(m(1:3,s,t),normal)
+      if (proj > bestProj) then
+        bestProj = proj
+        if (score(s) > best) then
+          best = score(s)
+          s_out = s
+          t_out = t
+        elseif (s_out == s) then
+          t_out = t
+        end if
+      end if
+    end do
+  end do
+
+end subroutine selectOutgoing
 
 
 !--------------------------------------------------------------------------------------------------
@@ -1442,6 +1735,9 @@ module subroutine plastic_nonlocal_result(ph,group)
         case('tau_pass')
           call result_writeDataset(dst%tau_pass,group,trim(prm%output(ou)), &
                                    'passing stress for slip','Pa', prm%systems_sl)
+        case('tau_back')
+          call result_writeDataset(dst%tau_back,group,trim(prm%output(ou)), &
+                                   'back stress (short range stress correction)','Pa', prm%systems_sl)
       end select
 
     end do
