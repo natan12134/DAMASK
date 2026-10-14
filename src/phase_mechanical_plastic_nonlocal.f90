@@ -116,7 +116,8 @@ submodule(phase:plastic) nonlocal
     logical :: &
       shortRangeStressCorrection, &                                                                 !< use of short range stress correction by excess density gradient term
       probabilisticGB, &                                                                            !< probabilistic dislocation transmission at grain boundaries (Zhang et al. 2023)
-      limitFluxVelocity, &                                                                          !< cap transport velocity at CFL limit and limit density losses (positivity) instead of enforcing cutback
+      limitFluxVelocity, &                                                                          !< cap transport velocity at CFL limit instead of enforcing cutback
+      limitPositivity, &                                                                            !< limit density losses to available density instead of enforcing cutback
       ratesZhang2023                                                                                !< dipole knock-out and jog formation according to Zhang et al. 2023
     character(len=:),          allocatable, dimension(:) :: &
       systems_sl
@@ -336,6 +337,7 @@ module function plastic_nonlocal_init() result(myPlasticity)
       prm%f_ed_mult                   = pl%get_asReal('f_ed_mult')
       prm%shortRangeStressCorrection  = pl%get_asBool('short_range_stress_correction', defaultVal = .false.)
       prm%limitFluxVelocity           = pl%get_asBool('flux_velocity_limit', defaultVal = .false.)
+      prm%limitPositivity             = pl%get_asBool('positivity_limit',    defaultVal = .false.)
 
       select case(pl%get_asStr('GB_transmission',defaultVal='compatibility'))
         case('compatibility')
@@ -1107,7 +1109,7 @@ module subroutine nonlocal_dotState(Mp,Delta_t, &
          + rhoDotThermalAnnihilation
 
 
-  if (prm%limitFluxVelocity) then                                                                   ! positivity preserving: do not lose more than available
+  if (prm%limitPositivity) then                                                                     ! positivity preserving: do not lose more than available
     rhoDot(:,1:4)  = max(rhoDot(:,1:4),  -rho(:,mob)/Delta_T)
     rhoDot(:,9:10) = max(rhoDot(:,9:10), -rho(:,dip)/Delta_T)
   end if

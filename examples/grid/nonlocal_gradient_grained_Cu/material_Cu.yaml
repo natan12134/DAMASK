@@ -61,5 +61,6 @@ phase:
         rho_min: 0.0
         atol_rho: 1.0e+8
         atol_gamma: 1.0e-4
-        C_CFL: 2.0                     # with flux_velocity_limit, outflow per step stays below the available density
-        flux_velocity_limit: true      # cap transport velocity at the CFL limit (positivity), slip uses the true velocity
+        C_CFL: 2.0                     # time increments are cut back if the CFL condition is violated
+        flux_velocity_limit: false     # true: cap transport velocity at CFL limit instead (fast, but time step dependent)
+        positivity_limit: true         # losses of (nearly depleted) species limited to available density
