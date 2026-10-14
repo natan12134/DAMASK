@@ -68,8 +68,7 @@ def numerics():
                                                            'eps_rel_div(P)': 5.0e-4,
                                                            'eps_abs_P': 1.0e3,
                                                            'eps_rel_P': 1.0e-3}}},
-                        'phase': {'mechanical': {'eps_rel_state': 1.0e-2,
-                                                 'plastic': {'integrator_state': 'Euler_adaptive'}}}})
+                        'phase': {'mechanical': {'plastic': {'integrator_state': 'Euler'}}}})
 
 
 def homogeneous(rng_seed=20230205):
@@ -135,8 +134,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--out', default=str(ROOT/'runs'), help='directory for simulation inputs')
     parser.add_argument('--cells-per-d', type=int, default=4, help='gradient model: cells per smallest grain size')
-    parser.add_argument('--N', type=int, nargs=2, default=[2000, 400],
-                        help='increments (finest grain size d=5 µm, coarsest d=80 µm), interpolated logarithmically')
+    parser.add_argument('--dt', type=float, nargs=2, default=[0.002, 0.02],
+                        help='time increment (yield, main) in s for a cell size of 1 µm, scaled linearly with cell size')
     parser.add_argument('--only', default='', help='substring filter for case names')
     args = parser.parse_args()
 
@@ -148,8 +147,10 @@ if __name__ == '__main__':
         g.save(w/'geom.vti')
         m.save(w/'material.yaml')
         numerics().save(w/'numerics.yaml')
-        x = np.log(d/5.0)/np.log(16.0)
-        N = int(round(np.exp((1-x)*np.log(args.N[0]) + x*np.log(args.N[1]))))
-        if name.endswith('noFlux'): N = args.N[1]
-        load(N, max(1, N//50)).save(w/'load.yaml')
+        dx = g.size[0]/g.cells[0]/1e-6
+        dt_yield, dt = [min(f*dx, 0.25) for f in args.dt]
+        if name.endswith('noFlux'): dt = max(dt, 0.05)
+        l = load(dt_yield, dt)
+        l.save(w/'load.yaml')
+        N = sum(s['discretization']['N'] for s in l['loadstep'])
         print(f'{name:30s} cells={g.cells} size={g.size*1e6} µm N={N}')

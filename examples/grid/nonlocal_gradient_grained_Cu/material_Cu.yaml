@@ -59,5 +59,7 @@ phase:
         rate_equations: Zhang2023
         rho_significant: 1.0e+6
         rho_min: 0.0
-        atol_rho: 1.0e+4
-        C_CFL: 1.5
+        atol_rho: 1.0e+8
+        atol_gamma: 1.0e-4
+        C_CFL: 2.0                     # with flux_velocity_limit, outflow per step stays below the available density
+        flux_velocity_limit: true      # cap transport velocity at the CFL limit (positivity), slip uses the true velocity

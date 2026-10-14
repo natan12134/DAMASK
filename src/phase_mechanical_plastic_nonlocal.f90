@@ -116,6 +116,7 @@ submodule(phase:plastic) nonlocal
     logical :: &
       shortRangeStressCorrection, &                                                                 !< use of short range stress correction by excess density gradient term
       probabilisticGB, &                                                                            !< probabilistic dislocation transmission at grain boundaries (Zhang et al. 2023)
+      limitFluxVelocity, &                                                                          !< cap transport velocity at CFL limit and limit density losses (positivity) instead of enforcing cutback
       ratesZhang2023                                                                                !< dipole knock-out and jog formation according to Zhang et al. 2023
     character(len=:),          allocatable, dimension(:) :: &
       systems_sl
@@ -334,6 +335,7 @@ module function plastic_nonlocal_init() result(myPlasticity)
       prm%chi_GB                      = pl%get_asReal('chi_GB',     defaultVal=-1.0_pREAL)
       prm%f_ed_mult                   = pl%get_asReal('f_ed_mult')
       prm%shortRangeStressCorrection  = pl%get_asBool('short_range_stress_correction', defaultVal = .false.)
+      prm%limitFluxVelocity           = pl%get_asBool('flux_velocity_limit', defaultVal = .false.)
 
       select case(pl%get_asStr('GB_transmission',defaultVal='compatibility'))
         case('compatibility')
@@ -1105,6 +1107,11 @@ module subroutine nonlocal_dotState(Mp,Delta_t, &
          + rhoDotThermalAnnihilation
 
 
+  if (prm%limitFluxVelocity) then                                                                   ! positivity preserving: do not lose more than available
+    rhoDot(:,1:4)  = max(rhoDot(:,1:4),  -rho(:,mob)/Delta_T)
+    rhoDot(:,9:10) = max(rhoDot(:,9:10), -rho(:,dip)/Delta_T)
+  end if
+
   if (    any(rho(:,mob) + rhoDot(:,1:4)  * Delta_T < -prm%atol_rho) &
      .or. any(rho(:,dip) + rhoDot(:,9:10) * Delta_T < -prm%atol_rho)) then
     plasticState(ph)%dotState = IEEE_value(1.0_pREAL,IEEE_quiet_NaN)
@@ -1209,7 +1216,9 @@ function rhoDotFlux(Delta_T,ph,en)
   if (plasticState(ph)%nonlocal) then
 
     !*** check CFL (Courant-Friedrichs-Lewy) condition for flux
-    if (any( abs(gamma_dot) > 0.0_pREAL &                                                           ! any active slip system ...
+    if (prm%limitFluxVelocity) then                                                                 ! transport velocity is capped at the CFL limit
+      v_0 = sign(min(abs(v_0),CFLvelocity(ph,en,Delta_t)),v_0)
+    elseif (any( abs(gamma_dot) > 0.0_pREAL &                                                           ! any active slip system ...
             .and. prm%C_CFL * abs(v_0) * Delta_T &
                 > geom(ph)%v_0(en)/ maxval(geom(ph)%a_0(:,en)))) then                               ! ...with velocity above critical value (we use the reference volume and area for simplicity here)
       rhoDotFlux = IEEE_value(1.0_pREAL,IEEE_quiet_NaN)                                             ! enforce cutback
@@ -1257,6 +1266,7 @@ function rhoDotFlux(Delta_T,ph,en)
       if (prm%probabilisticGB .and. n_nbr > 0) then
       if (dst%GB_isGB(n,en) .and. mechanical_plasticity_type(ph_nbr) == MECHANICAL_PLASTICITY_NONLOCAL) then
         v_0_nbr = reshape(state0(ph_nbr)%v(:,en_nbr),[ns,4])
+        if (prm%limitFluxVelocity) v_0_nbr = sign(min(abs(v_0_nbr),CFLvelocity(ph_nbr,en_nbr,Delta_t)),v_0_nbr)
         rho_0_sgl_mob_nbr = max(reshape(state0(ph_nbr)%rho_sgl_mob(:,en_nbr),[ns,4]),0.0_pREAL)
         where (rho_0_sgl_mob_nbr * geom(ph_nbr)%v_0(en_nbr) ** 0.667_pREAL < prm%rho_min &
           .or. rho_0_sgl_mob_nbr < prm%rho_significant) &
@@ -1301,6 +1311,7 @@ function rhoDotFlux(Delta_T,ph,en)
 
         ! ToDo MD: Not sure if ns is correct here, but I think that compatibility is 0 if different phase
         v_0_nbr = reshape(state0(ph_nbr)%v(:,en_nbr),[ns,4])
+        if (prm%limitFluxVelocity) v_0_nbr = sign(min(abs(v_0_nbr),CFLvelocity(ph_nbr,en_nbr,Delta_t)),v_0_nbr)
         rho_0_sgl_mob_nbr = max(reshape(state0(ph_nbr)%rho_sgl_mob(:,en_nbr),[ns,4]),0.0_pREAL)
 
         where (rho_0_sgl_mob_nbr * geom(ph_nbr)%v_0(en_nbr) ** 0.667_pREAL < prm%rho_min &
@@ -1348,6 +1359,7 @@ function rhoDotFlux(Delta_T,ph,en)
         !* Blocked dislocations are not leaving and remain as mobile density (pile-up), Zhang et al. 2023, section 3.3.
         rho_tot = sum(abs(rho_0))
         v_0_nbr = reshape(state0(ph_nbr)%v(:,en_nbr),[ns,4])
+        if (prm%limitFluxVelocity) v_0_nbr = sign(min(abs(v_0_nbr),CFLvelocity(ph_nbr,en_nbr,Delta_t)),v_0_nbr)
         normal_me2neighbor_defConf = math_det33(Favg) &
                                    * matmul(math_inv33(transpose(Favg)),geom(ph)%n_0(1:3,n,en))
         normal_me2neighbor = matmul(transpose(my_Fe), normal_me2neighbor_defConf) &
@@ -1407,6 +1419,21 @@ function rhoDotFlux(Delta_T,ph,en)
   end associate
 
 end function rhoDotFlux
+
+
+!--------------------------------------------------------------------------------------------------
+!> @brief Maximum dislocation velocity for transport satisfying the CFL condition.
+!--------------------------------------------------------------------------------------------------
+pure function CFLvelocity(ph,en,Delta_t) result(v_max)
+
+  integer, intent(in) :: ph, en
+  real(pREAL), intent(in) :: Delta_t
+  real(pREAL) :: v_max
+
+
+  v_max = geom(ph)%v_0(en)/maxval(geom(ph)%a_0(:,en)) / (param(ph)%C_CFL*Delta_t)
+
+end function CFLvelocity
 
 
 !--------------------------------------------------------------------------------------------------
