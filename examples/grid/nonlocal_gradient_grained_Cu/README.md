@@ -62,3 +62,21 @@ N_JOBS=4 ./run_all.sh runs                         # run (DAMASK_GRID=/path/to/d
 python postprocess.py --runs runs --out data       # reduce to data/*.npz
 python plot_figures.py --data data --figs figures  # figures
 ```
+
+## Status of the results
+
+The paper-exact runs (CFL condition enforced by sub-stepping) are very expensive: about 5 h for
+d = 20 µm and about 30 h per gradient case on one core. The cloud environment used for this
+reproduction was repeatedly restarted, which limited progress to the partial results in
+`data_partial/` and `figures_partial/`:
+
+| case | reached true strain | true stress |
+|---|---|---|
+| homogeneous d = 40 µm, full | 1.38% | 53.2 MPa |
+| homogeneous d = 20 µm, full | 0.79% | 55.1 MPa |
+| gradient, full | 0.11% | 35.6 MPa |
+| gradient, no back stress | 0.11% | 33.3 MPa |
+
+For comparison, Zhang et al. (Fig. 7a) report roughly 53 MPa (40 µm) and 55 MPa (20 µm) at these strains.
+Runs are restartable (`run_all.sh` continues from the last restart file), so the full set can be
+completed on a workstation or cluster with the commands in *Usage*.
