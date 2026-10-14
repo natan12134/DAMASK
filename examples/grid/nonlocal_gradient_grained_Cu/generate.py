@@ -55,10 +55,10 @@ def load(dt_yield, dt, n_out=60):
     return damask.LoadcaseGrid({'solver': {'mechanical': 'spectral_basic'},
                                 'loadstep': [{'boundary_condition': bc,
                                               'discretization': {'t': t_yield, 'N': N_1},
-                                              'f_out': max(1, N_1//5)},
+                                              'f_out': max(1, N_1//5), 'f_restart': 10},
                                              {'boundary_condition': bc,
                                               'discretization': {'t': float(t_end-t_yield), 'N': N_2},
-                                              'f_out': max(1, N_2//n_out)}]})
+                                              'f_out': max(1, N_2//n_out), 'f_restart': 10}]})
 
 
 def numerics():
