@@ -14,8 +14,15 @@ run() {
   [ -f job.done ] && exit 0
   restart=""
   if [ -f job_restart.hdf5 ]; then
-    inc=$("$PYTHON" -c "import h5py; print(h5py.File('job_restart.hdf5','r').attrs['increment'])" 2>/dev/null) \
-      && restart="-r $inc"
+    inc=$("$PYTHON" - <<'PY' 2>/dev/null
+import h5py
+inc = int(h5py.File('job_restart.hdf5','r').attrs['increment'])
+with h5py.File('job.hdf5','a') as f:                                # drop results written after the restart point
+    for k in [k for k in f if k.startswith('increment_') and int(k.split('_')[1]) > inc]:
+        del f[k]
+print(inc)
+PY
+) && restart="-r $inc"
   fi
   "$DAMASK_GRID" -l load.yaml -g geom.vti -m material.yaml -n numerics.yaml -j job $restart >> log.txt 2>&1 \
     && touch job.done || echo "FAILED: $1"
