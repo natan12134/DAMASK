@@ -157,7 +157,7 @@ def maps(cases, key, title, scale, label, name, vmax=None, cmap=SEQ, vmin=0.0, l
         ax.set_xticks([]); ax.set_yticks([]); ax.grid(False)
         ax.set_title(l, fontsize=8)
     fig.colorbar(im, ax=axes[0].tolist(), shrink=0.85, label=label)
-    fig.suptitle(title, fontsize=9, x=0.02, ha='left')
+    fig.suptitle(title, fontsize=9, x=0.02, y=1.06, ha='left')
     save(fig, name)
 
 

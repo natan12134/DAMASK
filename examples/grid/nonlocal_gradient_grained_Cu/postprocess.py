@@ -17,63 +17,51 @@ ROOT = Path(__file__).resolve().parent
 TYPES = ['ed_pos', 'ed_neg', 'sc_pos', 'sc_neg']
 
 
-def densities(r):
-    """Total and GND density per cell (summed over slip systems) for all increments."""
-    u = {t: r.get(f'rho_u_{t}', flatten=False) for t in TYPES}
-    b = {t: r.get(f'rho_b_{t}', flatten=False) for t in TYPES}
-    d_ed = r.get('rho_d_ed', flatten=False)
-    d_sc = r.get('rho_d_sc', flatten=False)
-    rho_tot, rho_gnd = {}, {}
-    for inc in u[TYPES[0]]:
-        k = lambda t: u[t][inc]['phase']['Cu'] + np.abs(b[t][inc]['phase']['Cu'])                  # noqa
-        tot = sum(k(t) for t in TYPES) + d_ed[inc]['phase']['Cu'] + d_sc[inc]['phase']['Cu']
-        gnd = np.abs(k('ed_pos') - k('ed_neg')) + np.abs(k('sc_pos') - k('sc_neg'))
-        rho_tot[inc] = tot.sum(axis=1)
-        rho_gnd[inc] = gnd.sum(axis=1)
-    return rho_tot, rho_gnd
+def densities(rv):
+    """Total and GND density per cell (summed over slip systems) of a single-increment view."""
+    k = {t: rv.get(f'rho_u_{t}') + np.abs(rv.get(f'rho_b_{t}')) for t in TYPES}
+    tot = sum(k.values()) + rv.get('rho_d_ed') + rv.get('rho_d_sc')
+    gnd = np.abs(k['ed_pos'] - k['ed_neg']) + np.abs(k['sc_pos'] - k['sc_neg'])
+    return tot.sum(axis=1), gnd.sum(axis=1)
 
 
 def process(case, out):
     r = damask.Result(case/'job.hdf5')
     g = damask.GeomGrid.load(case/'geom.vti')
     material_ID = g.material.flatten(order='F')
+    layer_file = ROOT/'layer_of_grain.txt'
+    layer = np.loadtxt(layer_file, dtype=int)[material_ID] \
+            if case.name.startswith('grad') and layer_file.exists() else None
 
-    P = r.get('P', flatten=False)
-    F = r.get('F', flatten=False)
-    rho_tot, rho_gnd = densities(r)
-    tau_b = r.get('tau_back', flatten=False) if 'full' in case.name else None
-
-    incs = list(P.keys())
-    eps, sig, rt, rg = [], [], [], []
-    sigma_vM = {}
-    for inc in incs:
-        Pi, Fi = P[inc]['phase']['Cu'], F[inc]['phase']['Cu']
-        sigma = np.einsum('nij,nkj->nik', Pi, Fi)/np.linalg.det(Fi)[:, None, None]                  # Cauchy stress per cell
-        sigma_vM[inc] = damask.mechanics.equivalent_stress_Mises(sigma)
-        F_av = Fi.mean(axis=0)
-        eps.append(np.log(F_av[0, 0]))
+    eps, sig, rt, rg, layers = [], [], [], [], []
+    for inc in r.increments:
+        rv = r.view(increments=inc)
+        P, F = rv.get('P'), rv.get('F')
+        if P is None: continue
+        sigma = np.einsum('nij,nkj->nik', P, F)/np.linalg.det(F)[:, None, None]                     # Cauchy stress per cell
+        vM = damask.mechanics.equivalent_stress_Mises(sigma)
+        tot, gnd = densities(rv)
+        eps.append(np.log(F.mean(axis=0)[0, 0]))
         sig.append(sigma[:, 0, 0].mean())
-        rt.append(rho_tot[inc].mean())
-        rg.append(rho_gnd[inc].mean())
+        rt.append(tot.mean())
+        rg.append(gnd.mean())
+        if layer is not None:
+            layers.append([[f[layer == l].mean() for l in (1, 2, 3)] for f in (tot, gnd, vM)])
 
-    last = incs[-1]
     data = dict(cells=g.cells, size=g.size, material=material_ID,
                 strain=np.array(eps), stress=np.array(sig),
                 rho_tot=np.array(rt), rho_gnd=np.array(rg),
-                field_rho_tot=rho_tot[last], field_rho_gnd=rho_gnd[last],
-                field_sigma_vM=sigma_vM[last])
-    if tau_b is not None:
-        data['field_tau_back'] = tau_b[last]['phase']['Cu']
-
-    layer_file = ROOT/'layer_of_grain.txt'
-    if case.name.startswith('grad') and layer_file.exists():
-        layer = np.loadtxt(layer_file, dtype=int)[material_ID]
+                field_rho_tot=tot, field_rho_gnd=gnd, field_sigma_vM=vM)
+    if 'full' in case.name:
+        data['field_tau_back'] = rv.get('tau_back')
+    if layer is not None:
         data['layer'] = layer
-        for name, field in [('rho_tot', rho_tot), ('rho_gnd', rho_gnd), ('sigma_vM', sigma_vM)]:
-            data[f'layer_{name}'] = np.array([[field[inc][layer == l].mean() for l in (1, 2, 3)] for inc in incs])
+        layers = np.array(layers)
+        for i, name in enumerate(['rho_tot', 'rho_gnd', 'sigma_vM']):
+            data[f'layer_{name}'] = layers[:, i, :]
 
     np.savez_compressed(out/f'{case.name}.npz', **data)
-    print(f'{case.name}: {len(incs)} increments, final strain {eps[-1]:.4f}, stress {sig[-1]/1e6:.1f} MPa')
+    print(f'{case.name}: {len(eps)} increments, final strain {eps[-1]:.4f}, stress {sig[-1]/1e6:.1f} MPa')
 
 
 if __name__ == '__main__':
